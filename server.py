@@ -2,20 +2,15 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import webbrowser
 import os
 import json
-import threading
-from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
-WISHES_FILE = Path(
-    os.environ.get(
-        "WISHES_FILE",
-        Path(__file__).with_name("wishes.json")
-    )
-)
-WISHES_LOCK = threading.Lock()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 
 class JiminHandler(SimpleHTTPRequestHandler):
@@ -31,26 +26,57 @@ class JiminHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
-    def read_wishes(self):
+    def supabase_request(self, method, query="", payload=None):
 
-        try:
-            wishes = json.loads(WISHES_FILE.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return []
-        except (json.JSONDecodeError, OSError):
-            return []
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError("Supabase environment variables are missing")
 
-        if not isinstance(wishes, list):
-            return []
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
+        }
+        body = None
 
-        return [wish for wish in wishes if isinstance(wish, str)]
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            headers["Prefer"] = "return=representation"
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        request = Request(
+            f"{SUPABASE_URL}/rest/v1/wishes{query}",
+            data=body,
+            headers=headers,
+            method=method
+        )
+
+        with urlopen(request, timeout=20) as response:
+            response_body = response.read()
+
+        return json.loads(response_body) if response_body else []
+
+
+    def fetch_wishes(self):
+
+        rows = self.supabase_request(
+            "GET",
+            "?select=message&order=id.asc"
+        )
+
+        return [
+            row["message"]
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("message"), str)
+        ]
 
 
     def do_GET(self):
 
         if urlsplit(self.path).path == "/api/wishes":
-            with WISHES_LOCK:
-                wishes = self.read_wishes()
+            try:
+                wishes = self.fetch_wishes()
+            except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError):
+                self.send_json(503, {"error": "Messages are temporarily unavailable"})
+                return
 
             self.send_json(200, wishes)
             return
@@ -95,17 +121,13 @@ class JiminHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            with WISHES_LOCK:
-                wishes = self.read_wishes()
-                wishes.extend(additions)
-                temporary_file = WISHES_FILE.with_suffix(".tmp")
-                temporary_file.write_text(
-                    json.dumps(wishes, ensure_ascii=False),
-                    encoding="utf-8"
-                )
-                os.replace(temporary_file, WISHES_FILE)
-        except OSError:
-            self.send_json(500, {"error": "Could not save messages"})
+            self.supabase_request(
+                "POST",
+                payload=[{"message": wish} for wish in additions]
+            )
+            wishes = self.fetch_wishes()
+        except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError):
+            self.send_json(503, {"error": "Could not save messages"})
             return
 
         self.send_json(201, wishes)
