@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: jimin-birthday
+    runtime: python
+    plan: starter
+    buildCommand: python -m py_compile server.py
+    startCommand: python server.py
+    disk:
+      name: wishes-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: OPEN_BROWSER
+        value: "0"
+      - key: WISHES_FILE
+        value: /var/data/wishes.json
